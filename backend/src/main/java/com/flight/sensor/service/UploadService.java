@@ -31,15 +31,19 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class UploadService {
 
+    private static final int BATCH_SIZE = 1000;
+    private static final Map<String, UploadTaskDTO> progressCache = new ConcurrentHashMap<>();
+    private static final Set<String> INVALID_NUMERIC_MARKERS = Set.of(
+            "nan", "infinity", "-infinity", "+infinity",
+            "na", "n/a", "null", "none", "-", "--", "nil", "err", "error", "undefined"
+    );
+
     private final UploadTaskRepository uploadTaskRepository;
     private final FlightRepository flightRepository;
     private final SensorDataRepository sensorDataRepository;
 
     @PersistenceContext
     private EntityManager entityManager;
-
-    private static final int BATCH_SIZE = 1000;
-    private static final Map<String, UploadTaskDTO> progressCache = new ConcurrentHashMap<>();
 
     private static final List<DateTimeFormatter> DATE_FORMATTERS = Arrays.asList(
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
@@ -83,12 +87,11 @@ public class UploadService {
 
         Flight flight = null;
         long totalProcessed = 0;
+        long skippedLines = 0;
         long firstTimestamp = Long.MAX_VALUE;
         long lastTimestamp = Long.MIN_VALUE;
         LocalDateTime firstTime = null;
         LocalDateTime lastTime = null;
-        String departure = null;
-        String arrival = null;
 
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(file.getInputStream(), StandardCharsets.UTF_8))) {
@@ -119,10 +122,21 @@ public class UploadService {
             }
 
             List<SensorData> batch = new ArrayList<>(BATCH_SIZE);
-            String[] line;
             long lineCount = 0;
 
-            while ((line = csvReader.readNext()) != null) {
+            while (true) {
+                String[] line;
+                try {
+                    line = csvReader.readNext();
+                } catch (CsvValidationException e) {
+                    lineCount++;
+                    skippedLines++;
+                    log.warn("第{}行CSV格式异常，跳过: {}", lineCount, e.getMessage());
+                    continue;
+                }
+                if (line == null) {
+                    break;
+                }
                 lineCount++;
 
                 try {
@@ -144,37 +158,53 @@ public class UploadService {
                         }
 
                         if (batch.size() >= BATCH_SIZE) {
-                            saveBatch(batch);
+                            try {
+                                saveBatch(batch);
+                            } catch (Exception e) {
+                                log.warn("第{}行附近批量写入失败，尝试逐条写入恢复: {}", lineCount, e.getMessage());
+                                recoverBatch(batch);
+                            }
                             batch.clear();
                             updateTaskProgress(taskId, totalProcessed);
                         }
+                    } else {
+                        skippedLines++;
                     }
                 } catch (Exception e) {
-                    log.warn("解析第{}行数据失败: {}", lineCount, e.getMessage());
+                    skippedLines++;
+                    log.warn("解析第{}行数据失败，跳过: {}", lineCount, e.getMessage());
                 }
 
                 if (lineCount % 10000 == 0) {
-                    log.debug("已处理 {} 行数据", lineCount);
+                    log.debug("已处理 {} 行数据，成功 {} 条，跳过 {} 行", lineCount, totalProcessed, skippedLines);
                 }
             }
 
             if (!batch.isEmpty()) {
-                saveBatch(batch);
+                try {
+                    saveBatch(batch);
+                } catch (Exception e) {
+                    log.warn("末尾批量写入失败，尝试逐条写入恢复: {}", e.getMessage());
+                    recoverBatch(batch);
+                }
             }
 
             final long finalTotalProcessed = totalProcessed;
             final LocalDateTime finalFirstTime = firstTime;
             final LocalDateTime finalLastTime = lastTime;
-            Flight finalFlight = flight;
 
-            flight = flightRepository.findById(flight.getId()).orElse(finalFlight);
+            flight = flightRepository.findById(flight.getId()).orElse(flight);
             flight.setDepartureTime(finalFirstTime);
             flight.setArrivalTime(finalLastTime);
             flight.setTotalRecords(finalTotalProcessed);
             flightRepository.save(flight);
 
+            if (skippedLines > 0) {
+                log.info("文件处理完成: taskId={}, 成功记录数={}, 跳过行数={}", taskId, totalProcessed, skippedLines);
+            } else {
+                log.info("文件处理完成: taskId={}, 总记录数={}", taskId, totalProcessed);
+            }
             updateTaskStatus(taskId, "COMPLETED", totalProcessed, totalProcessed, null);
-            log.info("文件处理完成: taskId={}, 总记录数={}", taskId, totalProcessed);
 
         } catch (Exception e) {
             log.error("文件处理失败: taskId={}", taskId, e);
@@ -252,8 +282,16 @@ public class UploadService {
         if (value == null || value.isEmpty()) {
             return null;
         }
+        String trimmed = value.trim().toLowerCase();
+        if (INVALID_NUMERIC_MARKERS.contains(trimmed)) {
+            return null;
+        }
         try {
-            return Double.parseDouble(value);
+            double result = Double.parseDouble(trimmed);
+            if (Double.isNaN(result) || Double.isInfinite(result)) {
+                return null;
+            }
+            return result;
         } catch (NumberFormatException e) {
             return null;
         }
@@ -266,6 +304,31 @@ public class UploadService {
         }
         entityManager.flush();
         entityManager.clear();
+    }
+
+    private void recoverBatch(List<SensorData> batch) {
+        try {
+            entityManager.clear();
+        } catch (Exception ignored) {
+        }
+        long recovered = 0;
+        for (SensorData data : batch) {
+            try {
+                entityManager.persist(data);
+                entityManager.flush();
+                entityManager.clear();
+                recovered++;
+            } catch (Exception e) {
+                try {
+                    entityManager.clear();
+                } catch (Exception ignored) {
+                }
+                log.debug("单条写入失败，跳过: {}", e.getMessage());
+            }
+        }
+        if (recovered > 0) {
+            log.info("批量恢复写入完成，成功恢复 {} 条记录", recovered);
+        }
     }
 
     private void updateTaskStatus(String taskId, String status, Long processed, Long total, String errorMsg) {
